@@ -1,0 +1,51 @@
+# Xcode
+#
+# gitignore contributors: remember to update Global/Xcode.gitignore, Objective-C.gitignore & Swift.gitignore
+
+## 用户设置
+xcuserdata/
+
+## 编译产物
+build/
+DerivedData/
+
+## 各种Xcode文件
+*.pbxuser
+!default.pbxuser
+*.mode1v3
+!default.mode1v3
+*.mode2v3
+!default.mode2v3
+*.perspectivev3
+!default.perspectivev3
+
+## 其他
+*.moved-aside
+*.xccheckout
+*.xcscmblueprint
+
+## App打包文件
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+## Playgrounds
+timeline.xctimeline
+playground.xcworkspace
+
+# Swift Package Manager
+.build/
+
+# CocoaPods
+Pods/
+
+# Carthage
+Carthage/Build/
+
+# macOS
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+set_env.sh
+.*rules
