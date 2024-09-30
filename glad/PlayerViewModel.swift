@@ -168,15 +168,26 @@ class PlayerViewModel: NSObject, ObservableObject {
     func togglePictureInPicture() {
         guard let pipController = pipController else {
             pipError = "画中画控制器未初始化"
+            logger.error("PiP controller is nil")
             return
         }
         
         if pipController.isPictureInPictureActive {
             pipController.stopPictureInPicture()
         } else if pipController.isPictureInPicturePossible {
+            logger.info("Attempting to start PiP")
             pipController.startPictureInPicture()
         } else {
             pipError = "当前无法启动画中画模式，请确保视频正在播放"
+            logger.error("PiP is not possible at this time. isPictureInPicturePossible: \(pipController.isPictureInPicturePossible)")
+            
+            // 检查播放器状态
+            if let player = self.player {
+                logger.info("Player rate: \(player.rate), status: \(player.status.rawValue)")
+                logger.info("Current item status: \(player.currentItem?.status.rawValue ?? -1)")
+            } else {
+                logger.error("Player is nil")
+            }
         }
     }
     

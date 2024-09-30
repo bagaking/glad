@@ -10,7 +10,8 @@ class VideoManager: ObservableObject {
     @Published var onlineVideos: [OnlineVideo] = []
     @Published var videoMemos: [String: String] = [:] // 存储视频注释
     @Published var isSyncing: Bool = false // 新增：同步状态
-    
+    @Published var memoSources: [String: Bool] = [:] // true 表示来自云端，false 表示本地
+
     private let logger = Logger(subsystem: Bundle.main.bundleIdentifier!, category: "VideoManager")
     private let memoManager = MemoManager()
     private let retryLimit = 3
@@ -112,14 +113,49 @@ class VideoManager: ObservableObject {
         }
     }
     
-    func getMemo(for video: PHAsset) async throws -> String {
-        return try await memoManager.fetchMemo(for: video.localIdentifier)
+    func getMemo(for video: PHAsset) async throws -> (String, Bool) {
+        logger.info("Getting memo for asset: \(video.localIdentifier)")
+        do {
+            let (memo, isFromCloud) = try await memoManager.fetchMemo(for: video.localIdentifier)
+            await MainActor.run {
+                self.videoMemos[video.localIdentifier] = memo
+                self.memoSources[video.localIdentifier] = isFromCloud
+            }
+            logger.info("Successfully fetched memo for asset: \(video.localIdentifier)")
+            return (memo, isFromCloud)
+        } catch {
+            logger.error("Failed to fetch memo from iCloud for asset: \(video.localIdentifier), error: \(error.localizedDescription)")
+            // 如果 iCloud 获取失败，尝试返回本地备注
+            if let localMemo = UserDefaults.standard.string(forKey: "LocalMemo_\(video.localIdentifier)") {
+                await MainActor.run {
+                    self.videoMemos[video.localIdentifier] = localMemo
+                    self.memoSources[video.localIdentifier] = false
+                }
+                logger.info("Returned local memo for asset: \(video.localIdentifier)")
+                return (localMemo, false)
+            }
+            throw error
+        }
     }
     
     func setMemo(for video: PHAsset, memo: String) async throws {
-        try await memoManager.saveMemo(for: video.localIdentifier, memo: memo)
-        await MainActor.run {
-            self.videoMemos[video.localIdentifier] = memo
+        // 先保存到本地
+        UserDefaults.standard.set(memo, forKey: "LocalMemo_\(video.localIdentifier)")
+        
+        do {
+            try await memoManager.saveMemo(for: video.localIdentifier, memo: memo)
+            await MainActor.run {
+                self.videoMemos[video.localIdentifier] = memo
+                self.memoSources[video.localIdentifier] = true // 标记为云端来源
+            }
+            logger.info("成功保存备注到云端: \(video.localIdentifier)")
+        } catch {
+            logger.error("保存备注到云端失败: \(error.localizedDescription)")
+            if let ckError = error as? CKError, ckError.code == .serverRejectedRequest {
+                throw NSError(domain: "VideoManager", code: 0, userInfo: [NSLocalizedDescriptionKey: "iCloud 服务暂时不可用，请稍后重试。备注已保存到本地。"])
+            } else {
+                throw error
+            }
         }
     }
     

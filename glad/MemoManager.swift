@@ -14,25 +14,28 @@ class MemoManager {
         logger.info("Initialized CKContainer and database")
     }
     
-    func saveMemo(for videoID: String, memo: String) async throws {
-        saveLocalMemo(for: videoID, memo: memo)
-        
-        let record = CKRecord(recordType: "VideoMemo")
-        record["videoID"] = videoID
-        record["memo"] = memo
-        
+    func saveMemo(for videoID: String, memo: String, retryCount: Int = 0) async throws {
         do {
+            try await privateDatabase.save(CKRecord(recordType: "VideoMemo", recordID: CKRecord.ID(recordName: videoID)))
+            let record = CKRecord(recordType: "VideoMemo", recordID: CKRecord.ID(recordName: videoID))
+            record["memo"] = memo
             try await privateDatabase.save(record)
             logger.info("成功保存备注到 iCloud: \(memo) 为视频: \(videoID)")
         } catch let error as CKError {
-            logger.error("保存备注到 iCloud 失败: \(error.localizedDescription)")
-            throw handleCloudKitError(error)
+            if error.code == .serverRejectedRequest && retryCount < 3 {
+                logger.warning("保存备注到 iCloud 失败，正在重试 (尝试 \(retryCount + 1)/3)")
+                try await Task.sleep(nanoseconds: UInt64(pow(2.0, Double(retryCount))) * 1_000_000_000)
+                try await saveMemo(for: videoID, memo: memo, retryCount: retryCount + 1)
+            } else {
+                logger.error("保存备注到 iCloud 失败: \(error.localizedDescription)")
+                throw handleCloudKitError(error)
+            }
         }
     }
     
-    func fetchMemo(for videoID: String) async throws -> String {
+    func fetchMemo(for videoID: String) async throws -> (String, Bool) {
         if let localMemo = getLocalMemo(for: videoID) {
-            return localMemo
+            return (localMemo, false) // 返回本地备注，并标记为非云端
         }
         
         let predicate = NSPredicate(format: "videoID == %@", videoID)
@@ -45,13 +48,13 @@ class MemoManager {
                 case .success(let record):
                     if let memo = record["memo"] as? String {
                         saveLocalMemo(for: videoID, memo: memo)
-                        return memo
+                        return (memo, true) // 返回云端备注，并标记为云端
                     }
                 case .failure(let error):
                     logger.error("获取记录失败: \(error.localizedDescription)")
                 }
             }
-            return ""
+            return ("", true) // 没有找到记录，但成功查询了云端
         } catch let error as CKError {
             logger.error("从 iCloud 获取备注失败: \(error.localizedDescription)")
             throw handleCloudKitError(error)

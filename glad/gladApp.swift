@@ -9,11 +9,13 @@ import SwiftUI
 import os
 import AVFoundation
 import CloudKit
+import Network
 
 @main
 struct gladApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     private let logger = Logger(subsystem: Bundle.main.bundleIdentifier!, category: "gladApp")
+    @StateObject private var networkMonitor = NetworkMonitor()
     
     init() {
         setupAudioSession()
@@ -24,6 +26,7 @@ struct gladApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView()
+                .environmentObject(networkMonitor)
         }
     }
     
@@ -126,5 +129,20 @@ class AppDelegate: NSObject, UIApplicationDelegate {
     
     static func handleException(_ exception: NSException) {
         logger.fault("Uncaught exception: \(exception.name.rawValue), reason: \(exception.reason ?? "Unknown reason")")
+    }
+}
+
+class NetworkMonitor: ObservableObject {
+    private let monitor = NWPathMonitor()
+    private let queue = DispatchQueue(label: "NetworkMonitor")
+    @Published var isConnected = true
+
+    init() {
+        monitor.pathUpdateHandler = { [weak self] path in
+            DispatchQueue.main.async {
+                self?.isConnected = path.status == .satisfied
+            }
+        }
+        monitor.start(queue: queue)
     }
 }

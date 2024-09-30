@@ -11,6 +11,7 @@ import AVKit
 import os
 import CoreLocation
 import CloudKit
+import Network
 
 struct ContentView: View {
     @StateObject private var videoManager = VideoManager()
@@ -28,12 +29,19 @@ struct ContentView: View {
     @State private var isCardView = false
     @State private var isPlayerReady = false
     @State private var showNetworkError = false
+    @EnvironmentObject var networkMonitor: NetworkMonitor
     
     private let logger = Logger(subsystem: Bundle.main.bundleIdentifier!, category: "ContentView")
 
     var body: some View {
         NavigationView {
             VStack(spacing: 0) {
+                if !networkMonitor.isConnected {
+                    Text("网络连接已断开")
+                        .foregroundColor(.red)
+                        .padding()
+                        .background(Color(UIColor.systemBackground))
+                }
                 categoryPicker
                 videoGrid
             }
@@ -77,6 +85,8 @@ struct ContentView: View {
             .sheet(isPresented: $isShowingMemoEditor) {
                 if let asset = selectedVideoForMemo {
                     MemoEditorView(asset: asset, videoManager: videoManager)
+                } else {
+                    Text("No video selected")
                 }
             }
             .onAppear {
@@ -111,12 +121,16 @@ struct ContentView: View {
         }
         .pickerStyle(SegmentedPickerStyle())
         .padding(.horizontal)
-        .padding(.top, 8)
+        .padding(.vertical, 8)  // 增加垂直方向的内边距
+        .background(Color(UIColor.secondarySystemBackground))  // 添加背景色
     }
     
     private var videoGrid: some View {
         ScrollView {
             LazyVStack(spacing: 16) {
+                // 添加一个空的视图来创建顶部间距
+                Color.clear.frame(height: 16)
+                
                 if selectedCategory == .online {
                     ForEach(videoManager.onlineVideos) { video in
                         OnlineVideoCard(video: video)
@@ -164,7 +178,7 @@ struct ContentView: View {
         case .favorites:
             return videoManager.videos.filter { videoManager.isFollowed($0) }
         case .online:
-            return [] // 这里需要实现��络内容的获取逻辑
+            return [] // 这需要实现网络内容的获取逻辑
         }
     }
     
@@ -176,31 +190,24 @@ struct ContentView: View {
     private func preloadVideos() async {
         let preloadCount = min(filteredVideos.count, 5) // 预加载前5个视频
         
-        await withTaskGroup(of: Void.self) { group in
-            for video in filteredVideos.prefix(preloadCount) {
-                group.addTask {
-                    await self.playerViewModel.preloadAssets([video])
-                }
-                
-                group.addTask {
-                    await self.preloadMemo(for: video)
-                }
+        for video in filteredVideos.prefix(preloadCount) {
+            do {
+                try await playerViewModel.preloadAssets([video])
+                try await preloadMemo(for: video)
+                logger.info("Successfully preloaded video and memo for asset: \(video.localIdentifier)")
+            } catch {
+                logger.error("Failed to preload video or memo for asset: \(video.localIdentifier), error: \(error.localizedDescription)")
             }
         }
     }
     
-    private func preloadMemo(for video: PHAsset) async {
+    private func preloadMemo(for video: PHAsset) async throws {
         do {
-            let memo = try await videoManager.getMemo(for: video)
-            await MainActor.run {
-                videoManager.videoMemos[video.localIdentifier] = memo
-            }
+            let (memo, _) = try await videoManager.getMemo(for: video)
+            logger.info("Preloaded memo for asset: \(video.localIdentifier), memo length: \(memo.count)")
         } catch {
-            if let ckError = error as? CKError, ckError.code == .networkUnavailable || ckError.code == .networkFailure {
-                await MainActor.run {
-                    self.showNetworkError = true
-                }
-            }
+            logger.error("Failed to preload memo for asset: \(video.localIdentifier), error: \(error.localizedDescription)")
+            throw error
         }
     }
     
@@ -259,44 +266,7 @@ struct VideoCardView: View {
     var body: some View {
         HStack(spacing: 12) {
             // 左侧缩略图
-            ZStack {
-                if let thumbnail = thumbnail {
-                    Image(uiImage: thumbnail)
-                        .resizable()
-                        .aspectRatio(contentMode: .fill)
-                        .frame(width: 120, height: 80)
-                        .clipped()
-                } else if isLoading {
-                    ProgressView()
-                        .frame(width: 120, height: 80)
-                } else {
-                    Color.gray
-                        .frame(width: 120, height: 80)
-                }
-                
-                VStack {
-                    Spacer()
-                    HStack {
-                        if isCloudAsset {
-                            Image(systemName: "icloud.and.arrow.down")
-                                .foregroundColor(.white)
-                                .padding(4)
-                                .background(Color.black.opacity(0.7))
-                                .cornerRadius(4)
-                        }
-                        Spacer()
-                        Text(formatDuration(video.duration))
-                            .font(.caption2)
-                            .padding(4)
-                            .background(Color.black.opacity(0.7))
-                            .foregroundColor(.white)
-                            .cornerRadius(4)
-                    }
-                    .padding(4)
-                }
-            }
-            .frame(width: 120, height: 80)
-            .cornerRadius(8)
+            thumbnailView
             
             // 右侧信息
             VStack(alignment: .leading, spacing: 4) {
@@ -312,6 +282,7 @@ struct VideoCardView: View {
                     Text(locationInfo)
                         .font(.caption)
                         .foregroundColor(.gray)
+                        .lineLimit(1)
                 }
                 
                 if !memoPreview.isEmpty {
@@ -332,12 +303,16 @@ struct VideoCardView: View {
                         Image(systemName: "note.text")
                             .foregroundColor(.blue)
                     }
-                    Image(systemName: isFollowed ? "star.fill" : "star")
-                        .foregroundColor(isFollowed ? .yellow : .gray)
+                    Button(action: {
+                        videoManager.toggleFollow(video)
+                    }) {
+                        Image(systemName: isFollowed ? "star.fill" : "star")
+                            .foregroundColor(isFollowed ? .yellow : .gray)
+                    }
                 }
             }
         }
-        .frame(height: 80)
+        .frame(height: 100)  // 增加高度以容纳更多内容
         .padding(.vertical, 4)
         .background(Color(UIColor.secondarySystemBackground))
         .cornerRadius(10)
@@ -350,6 +325,47 @@ struct VideoCardView: View {
             getLocationInfo()
             loadMemoPreview()
         }
+    }
+    
+    private var thumbnailView: some View {
+        ZStack {
+            if let thumbnail = thumbnail {
+                Image(uiImage: thumbnail)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+                    .frame(width: 120, height: 80)
+                    .clipped()
+            } else if isLoading {
+                ProgressView()
+                    .frame(width: 120, height: 80)
+            } else {
+                Color.gray
+                    .frame(width: 120, height: 80)
+            }
+            
+            VStack {
+                Spacer()
+                HStack {
+                    if isCloudAsset {
+                        Image(systemName: "icloud.and.arrow.down")
+                            .foregroundColor(.white)
+                            .padding(4)
+                            .background(Color.black.opacity(0.7))
+                            .cornerRadius(4)
+                    }
+                    Spacer()
+                    Text(formatDuration(video.duration))
+                        .font(.caption2)
+                        .padding(4)
+                        .background(Color.black.opacity(0.7))
+                        .foregroundColor(.white)
+                        .cornerRadius(4)
+                }
+                .padding(4)
+            }
+        }
+        .frame(width: 120, height: 80)
+        .cornerRadius(8)
     }
     
     private func loadThumbnail() {
@@ -410,7 +426,7 @@ struct VideoCardView: View {
             "YT_": "YouTube",
         ]
         
-        // 检��文件名前缀
+        // 检查文件名前缀
         for (prefix, appName) in knownPrefixes {
             if filename.hasPrefix(prefix) {
                 return appName
@@ -476,44 +492,7 @@ struct VideoListItemView: View {
     var body: some View {
         HStack(spacing: 12) {
             // 左侧缩略图
-            ZStack {
-                if let thumbnail = thumbnail {
-                    Image(uiImage: thumbnail)
-                        .resizable()
-                        .aspectRatio(contentMode: .fill)
-                        .frame(width: 120, height: 80)
-                        .clipped()
-                } else if isLoading {
-                    ProgressView()
-                        .frame(width: 120, height: 80)
-                } else {
-                    Color.gray
-                        .frame(width: 120, height: 80)
-                }
-                
-                VStack {
-                    Spacer()
-                    HStack {
-                        if isCloudAsset {
-                            Image(systemName: "icloud.and.arrow.down")
-                                .foregroundColor(.white)
-                                .padding(4)
-                                .background(Color.black.opacity(0.7))
-                                .cornerRadius(4)
-                        }
-                        Spacer()
-                        Text(formatDuration(video.duration))
-                            .font(.caption2)
-                            .padding(4)
-                            .background(Color.black.opacity(0.7))
-                            .foregroundColor(.white)
-                            .cornerRadius(4)
-                    }
-                    .padding(4)
-                }
-            }
-            .frame(width: 120, height: 80)
-            .cornerRadius(8)
+            thumbnailView
             
             // 右侧信息
             VStack(alignment: .leading, spacing: 4) {
@@ -529,6 +508,7 @@ struct VideoListItemView: View {
                     Text(locationInfo)
                         .font(.caption)
                         .foregroundColor(.gray)
+                        .lineLimit(1)
                 }
                 
                 if !memoPreview.isEmpty {
@@ -549,12 +529,16 @@ struct VideoListItemView: View {
                         Image(systemName: "note.text")
                             .foregroundColor(.blue)
                     }
-                    Image(systemName: isFollowed ? "star.fill" : "star")
-                        .foregroundColor(isFollowed ? .yellow : .gray)
+                    Button(action: {
+                        videoManager.toggleFollow(video)
+                    }) {
+                        Image(systemName: isFollowed ? "star.fill" : "star")
+                            .foregroundColor(isFollowed ? .yellow : .gray)
+                    }
                 }
             }
         }
-        .frame(height: 80)
+        .frame(height: 100)  // 增加高度以容纳更多内容
         .padding(.vertical, 4)
         .background(Color(UIColor.secondarySystemBackground))
         .cornerRadius(10)
@@ -567,6 +551,47 @@ struct VideoListItemView: View {
             getLocationInfo()
             loadMemoPreview()
         }
+    }
+    
+    private var thumbnailView: some View {
+        ZStack {
+            if let thumbnail = thumbnail {
+                Image(uiImage: thumbnail)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+                    .frame(width: 120, height: 80)
+                    .clipped()
+            } else if isLoading {
+                ProgressView()
+                    .frame(width: 120, height: 80)
+            } else {
+                Color.gray
+                    .frame(width: 120, height: 80)
+            }
+            
+            VStack {
+                Spacer()
+                HStack {
+                    if isCloudAsset {
+                        Image(systemName: "icloud.and.arrow.down")
+                            .foregroundColor(.white)
+                            .padding(4)
+                            .background(Color.black.opacity(0.7))
+                            .cornerRadius(4)
+                    }
+                    Spacer()
+                    Text(formatDuration(video.duration))
+                        .font(.caption2)
+                        .padding(4)
+                        .background(Color.black.opacity(0.7))
+                        .foregroundColor(.white)
+                        .cornerRadius(4)
+                }
+                .padding(4)
+            }
+        }
+        .frame(width: 120, height: 80)
+        .cornerRadius(8)
     }
     
     private func loadThumbnail() {
@@ -733,176 +758,6 @@ struct AddOnlineVideoView: View {
                 .disabled(url.isEmpty || title.isEmpty)
             )
         }
-    }
-}
-
-struct MemoEditorView: View {
-    let asset: PHAsset
-    @ObservedObject var videoManager: VideoManager
-    @State private var memo: String = ""
-    @State private var isLoading = true
-    @Environment(\.presentationMode) var presentationMode
-    @State private var showAlert = false
-    @State private var alertMessage = ""
-    @State private var memoSource: MemoSource = .loading
-    
-    private enum MemoSource {
-        case loading, local, cloud, new
-    }
-    
-    private let logger = Logger(subsystem: Bundle.main.bundleIdentifier!, category: "MemoEditorView")
-    
-    var body: some View {
-        NavigationView {
-            ZStack {
-                VStack(spacing: 0) {
-                    HStack {
-                        memoSourceView
-                        Spacer()
-                    }
-                    .padding(.horizontal)
-                    
-                    TextEditor(text: $memo)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .padding()
-                        .background(Color(UIColor.systemBackground))
-                        .cornerRadius(12)
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 12)
-                                .stroke(Color.blue.opacity(0.5), lineWidth: 2)
-                        )
-                        .padding()
-                        .shadow(color: .blue.opacity(0.3), radius: 10, x: 0, y: 5)
-                    
-                    HStack {
-                        Button(action: {
-                            // 这里可以添加附加功能，比如添加图片等
-                        }) {
-                            Image(systemName: "paperclip")
-                                .foregroundColor(.blue)
-                        }
-                        
-                        Spacer()
-                        
-                        Button("保存") {
-                            saveMemo()
-                        }
-                        .padding(.horizontal, 20)
-                        .padding(.vertical, 10)
-                        .background(Color.blue)
-                        .foregroundColor(.white)
-                        .cornerRadius(25)
-                    }
-                    .padding()
-                }
-                
-                if isLoading {
-                    ProgressView()
-                        .scaleEffect(1.5)
-                        .progressViewStyle(CircularProgressViewStyle(tint: .blue))
-                }
-            }
-            .navigationBarTitle("编辑备注", displayMode: .inline)
-            .navigationBarItems(leading: Button("取消") {
-                presentationMode.wrappedValue.dismiss()
-            })
-            .alert(isPresented: $showAlert) {
-                Alert(title: Text("提示"), message: Text(alertMessage), dismissButton: .default(Text("确定")))
-            }
-        }
-        .onAppear {
-            loadMemo()
-        }
-    }
-    
-    private var memoSourceView: some View {
-        HStack {
-            Image(systemName: memoSourceIconName)
-                .foregroundColor(memoSourceColor)
-            Text(memoSourceText)
-                .font(.caption)
-                .foregroundColor(memoSourceColor)
-        }
-    }
-    
-    private var memoSourceIconName: String {
-        switch memoSource {
-        case .loading: return "hourglass"
-        case .local: return "iphone"
-        case .cloud: return "icloud"
-        case .new: return "plus.circle"
-        }
-    }
-    
-    private var memoSourceColor: Color {
-        switch memoSource {
-        case .loading: return .gray
-        case .local: return .green
-        case .cloud: return .blue
-        case .new: return .orange
-        }
-    }
-    
-    private var memoSourceText: String {
-        switch memoSource {
-        case .loading: return "加载中"
-        case .local: return "本地"
-        case .cloud: return "云端"
-        case .new: return "新建"
-        }
-    }
-    
-    private func loadMemo() {
-        isLoading = true
-        memoSource = .loading
-        Task {
-            do {
-                let loadedMemo = try await videoManager.getMemo(for: asset)
-                await MainActor.run {
-                    self.memo = loadedMemo
-                    self.memoSource = loadedMemo.isEmpty ? .new : .cloud
-                    self.isLoading = false
-                }
-            } catch {
-                await MainActor.run {
-                    logger.error("加载备注失败: \(error.localizedDescription)")
-                    showAlertMessage("加载备注失败: \(error.localizedDescription)")
-                    self.memoSource = .local
-                    self.isLoading = false
-                    // 尝试加载本地备注
-                    if let localMemo = UserDefaults.standard.string(forKey: "LocalMemo_\(asset.localIdentifier)") {
-                        self.memo = localMemo
-                    }
-                }
-            }
-        }
-    }
-    
-    private func saveMemo() {
-        Task {
-            do {
-                try await videoManager.setMemo(for: asset, memo: memo)
-                logger.info("备注保存成功")
-                // 同时保存到本地
-                UserDefaults.standard.set(memo, forKey: "LocalMemo_\(asset.localIdentifier)")
-                await MainActor.run {
-                    presentationMode.wrappedValue.dismiss()
-                }
-            } catch {
-                logger.error("保存备注失败: \(error.localizedDescription)")
-                await MainActor.run {
-                    showAlertMessage("保存备注失败: \(error.localizedDescription)")
-                    // 保存到本地
-                    UserDefaults.standard.set(memo, forKey: "LocalMemo_\(asset.localIdentifier)")
-                    self.memoSource = .local
-                }
-            }
-        }
-    }
-    
-    private func showAlertMessage(_ message: String) {
-        alertMessage = message
-        showAlert = true
     }
 }
 
