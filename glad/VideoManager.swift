@@ -1,43 +1,28 @@
 import SwiftUI
 import Photos
 import os
+import CloudKit
 
 class VideoManager: ObservableObject {
     @Published var videos: [PHAsset] = []
     @Published var followedVideos: Set<String> = []
     @Published var recentlyWatchedVideos: [PHAsset] = []
     @Published var onlineVideos: [OnlineVideo] = []
+    @Published var videoMemos: [String: String] = [:] // 存储视频注释
+    @Published var isSyncing: Bool = false // 新增：同步状态
     
     private let logger = Logger(subsystem: Bundle.main.bundleIdentifier!, category: "VideoManager")
+    private let memoManager = MemoManager()
+    private let retryLimit = 3
+    private let retryDelay: TimeInterval = 2.0
+    private var syncTimer: Timer?
+    
+    // MARK: - Public Methods
     
     func requestAccess() {
         PHPhotoLibrary.requestAuthorization(for: .readWrite) { [weak self] status in
             guard let self = self else { return }
-            switch status {
-            case .authorized, .limited:
-                self.fetchVideos()
-            case .denied, .restricted:
-                DispatchQueue.main.async {
-                    self.logger.error("Photo library access denied or restricted")
-                }
-            case .notDetermined:
-                self.logger.info("Photo library access not determined")
-            @unknown default:
-                self.logger.error("Unknown photo library access status")
-            }
-        }
-    }
-    
-    private func fetchVideos() {
-        let fetchOptions = PHFetchOptions()
-        fetchOptions.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
-        let allVideos = PHAsset.fetchAssets(with: .video, options: fetchOptions)
-        
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self else { return }
-            self.videos = allVideos.objects(at: IndexSet(0..<allVideos.count))
-            self.sortVideos()
-            self.logger.info("Fetched \(self.videos.count) videos")
+            self.handleAuthorizationStatus(status)
         }
     }
     
@@ -54,18 +39,6 @@ class VideoManager: ObservableObject {
         followedVideos.contains(video.localIdentifier)
     }
     
-    private func sortVideos() {
-        videos.sort { (video1, video2) -> Bool in
-            let isFollowed1 = followedVideos.contains(video1.localIdentifier)
-            let isFollowed2 = followedVideos.contains(video2.localIdentifier)
-            
-            if isFollowed1 == isFollowed2 {
-                return video1.creationDate ?? Date() > video2.creationDate ?? Date()
-            }
-            return isFollowed1 && !isFollowed2
-        }
-    }
-    
     func addToRecentlyWatched(_ video: PHAsset) {
         if let index = recentlyWatchedVideos.firstIndex(of: video) {
             recentlyWatchedVideos.remove(at: index)
@@ -74,12 +47,6 @@ class VideoManager: ObservableObject {
         if recentlyWatchedVideos.count > 20 {  // 限制最近观看列表的大小
             recentlyWatchedVideos.removeLast()
         }
-    }
-    
-    func fetchOnlineVideos() {
-        // 实现从网络获取视频的逻辑
-        // 这可能涉及到网络请求、数据解析等
-        // 获取到数据后，更新 onlineVideos 数组
     }
     
     func addOnlineVideo(url: String, title: String) {
@@ -100,12 +67,6 @@ class VideoManager: ObservableObject {
         logger.info("Removed online video with id: \(id)")
     }
     
-    private func saveOnlineVideos() {
-        // 将 onlineVideos 保存到 UserDefaults 或其他持久化存储
-        let videosData = onlineVideos.map { ["id": $0.id, "title": $0.title, "url": $0.videoURL.absoluteString] }
-        UserDefaults.standard.set(videosData, forKey: "OnlineVideos")
-    }
-    
     func loadOnlineVideos() {
         guard let videosData = UserDefaults.standard.array(forKey: "OnlineVideos") as? [[String: String]] else {
             return
@@ -122,11 +83,147 @@ class VideoManager: ObservableObject {
         }
         logger.info("Loaded \(self.onlineVideos.count) online videos")
     }
+    
+    func checkVideoAvailability(_ asset: PHAsset, completion: @escaping (Result<Void, Error>) -> Void) {
+        let resources = PHAssetResource.assetResources(for: asset)
+        guard let videoResource = resources.first(where: { $0.type == .video }) else {
+            completion(.failure(NSError(domain: "VideoManager", code: 0, userInfo: [NSLocalizedDescriptionKey: "找不到视频资源"])))
+            return
+        }
+        
+        let options = PHAssetResourceRequestOptions()
+        options.isNetworkAccessAllowed = true
+        PHAssetResourceManager.default().requestData(for: videoResource, options: options) { data in
+            DispatchQueue.main.async {
+                if data.isEmpty {
+                    completion(.failure(NSError(domain: "VideoManager", code: 1, userInfo: [NSLocalizedDescriptionKey: "视频数据为空"])))
+                } else {
+                    completion(.success(()))
+                }
+            }
+        } completionHandler: { error in
+            DispatchQueue.main.async {
+                if let error = error {
+                    completion(.failure(error))
+                } else {
+                    completion(.success(()))
+                }
+            }
+        }
+    }
+    
+    func getMemo(for video: PHAsset) async throws -> String {
+        return try await memoManager.fetchMemo(for: video.localIdentifier)
+    }
+    
+    func setMemo(for video: PHAsset, memo: String) async throws {
+        try await memoManager.saveMemo(for: video.localIdentifier, memo: memo)
+        await MainActor.run {
+            self.videoMemos[video.localIdentifier] = memo
+        }
+    }
+    
+    func startSyncTimer() {
+        syncTimer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
+            self?.syncMemos()
+        }
+    }
+    
+    func stopSyncTimer() {
+        syncTimer?.invalidate()
+        syncTimer = nil
+    }
+    
+    func syncMemos() {
+        Task {
+            await MainActor.run { self.isSyncing = true }
+            
+            for (videoID, memo) in videoMemos {
+                do {
+                    try await memoManager.saveMemo(for: videoID, memo: memo)
+                    logger.info("同步备注成功: \(videoID)")
+                } catch {
+                    logger.error("同步备注失败: \(videoID), 错误: \(error.localizedDescription)")
+                }
+            }
+            
+            await MainActor.run { self.isSyncing = false }
+        }
+    }
+    
+    // MARK: - Private Methods
+    
+    private func handleAuthorizationStatus(_ status: PHAuthorizationStatus) {
+        DispatchQueue.main.async {
+            switch status {
+            case .authorized, .limited:
+                self.fetchVideos()
+            case .denied, .restricted:
+                self.logger.error("Photo library access denied or restricted")
+            case .notDetermined:
+                self.logger.info("Photo library access not determined")
+            @unknown default:
+                self.logger.error("Unknown photo library access status")
+            }
+        }
+    }
+    
+    private func fetchVideos() {
+        let fetchOptions = PHFetchOptions()
+        fetchOptions.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+        let allVideos = PHAsset.fetchAssets(with: .video, options: fetchOptions)
+        
+        self.videos = allVideos.objects(at: IndexSet(0..<allVideos.count))
+        sortVideos()
+        logger.info("Fetched \(self.videos.count) videos")
+        loadMemos()
+    }
+    
+    private func sortVideos() {
+        self.videos.sort { (video1, video2) -> Bool in
+            let isFollowed1 = self.followedVideos.contains(video1.localIdentifier)
+            let isFollowed2 = self.followedVideos.contains(video2.localIdentifier)
+            
+            if isFollowed1 == isFollowed2 {
+                return video1.creationDate ?? Date() > video2.creationDate ?? Date()
+            }
+            return isFollowed1 && !isFollowed2
+        }
+    }
+    
+    private func saveOnlineVideos() {
+        let videosData = onlineVideos.map { ["id": $0.id, "title": $0.title, "url": $0.videoURL.absoluteString] }
+        UserDefaults.standard.set(videosData, forKey: "OnlineVideos")
+    }
+    
+    private func saveMemos() {
+        if let encoded = try? JSONEncoder().encode(self.videoMemos) {
+            UserDefaults.standard.set(encoded, forKey: "VideoMemos")
+            self.logger.info("保存备注到 UserDefaults")
+        }
+    }
+    
+    private func loadMemos() {
+        if let savedMemos = UserDefaults.standard.object(forKey: "VideoMemos") as? Data {
+            if let decodedMemos = try? JSONDecoder().decode([String: String].self, from: savedMemos) {
+                self.videoMemos = decodedMemos
+                self.logger.info("从 UserDefaults 加载备注: \(self.videoMemos.count) 条")
+            }
+        }
+    }
+    
+    init() {
+        loadMemos()
+        startSyncTimer()
+    }
+    
+    deinit {
+        stopSyncTimer()
+    }
 }
 
 struct OnlineVideo: Identifiable {
     let id: String
     let title: String
     let videoURL: URL
-    // 其他需要的属性
 }

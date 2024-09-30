@@ -1,6 +1,7 @@
 {
   "images" : [
     {
+      "filename" : "glad_player_icon 1.png",
       "idiom" : "universal",
       "platform" : "ios",
       "size" : "1024x1024"
@@ -12,6 +13,7 @@
           "value" : "dark"
         }
       ],
+      "filename" : "glad_player_icon.png",
       "idiom" : "universal",
       "platform" : "ios",
       "size" : "1024x1024"
@@ -23,6 +25,7 @@
           "value" : "tinted"
         }
       ],
+      "filename" : "glad_player_icon 2.png",
       "idiom" : "universal",
       "platform" : "ios",
       "size" : "1024x1024"
